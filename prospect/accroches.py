@@ -1,41 +1,11 @@
 """
-Generation d'accroches personnalisees via IA (Google GenAI).
-Robuste : retry sur 503/surcharges + accroche de secours sans IA.
+Generation d'accroches personnalisees via IA (Gemini avec fallback Groq).
+Robuste : utilise client IA unifié + accroche de secours sans IA.
 """
-import os
-import time
+from prospect.ia_client import get_ia_client
+from prospect.config import get_logger
 
-from google import genai
-from google.genai import errors as genai_errors
-
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODELE = "gemini-3.6-flash"  # ajuste a ton modele habituel
-
-
-# ============================================================
-# 🔁 Appel IA avec retry (503 = surcharge temporaire Google)
-# ============================================================
-
-def appeler_ia(prompt: str, max_essais: int = 4) -> str:
-    """Appelle Gemini en reessayant sur les erreurs serveur."""
-    derniere_erreur = None
-    for essai in range(max_essais):
-        try:
-            resp = client.models.generate_content(
-                model=MODELE, contents=prompt)
-            return resp.text
-        except genai_errors.ServerError as e:
-            derniere_erreur = e
-            pause = 5 * (essai + 1)  # 5s, 10s, 15s, 20s
-            print(f"⚠️ Surcharge Google (503), nouvelle tentative "
-                  f"dans {pause}s... ({essai + 1}/{max_essais})")
-            time.sleep(pause)
-        except genai_errors.ClientError as e:
-            # 4xx : cle invalide, quota... inutile de reessayer
-            raise RuntimeError(f"Erreur API Gemini ({e.code}) : "
-                               "verifie ta cle/quota") from e
-    raise RuntimeError(f"Google surcharge apres {max_essais} essais "
-                       f"({derniere_erreur})")
+logger = get_logger("accroches")
 
 
 # ============================================================
@@ -43,9 +13,17 @@ def appeler_ia(prompt: str, max_essais: int = 4) -> str:
 # ============================================================
 
 def generer_accroche(p: dict) -> str:
-    """Genere une accroche personnalisee. Ne leve JAMAIS d'exception :
+    """
+    Genere une accroche personnalisee. Ne leve JAMAIS d'exception :
     en cas d'echec IA, retourne une accroche de secours construite
-    depuis les donnees locales."""
+    depuis les donnees locales.
+
+    Args:
+        p: Dict prospect avec nom, note, nb_avis, avis, angle_accroche, etc.
+
+    Returns:
+        Texte d'accroche prêt à envoyer
+    """
     nom = p.get("nom", "votre établissement")
     angle = p.get("angle_accroche") or ""
     avis = p.get("avis") or []
@@ -75,10 +53,12 @@ Termine par une question ouverte simple. Pas de markdown, texte brut.
 
 {contexte}
 """
+
     try:
-        return appeler_ia(prompt).strip()
-    except RuntimeError as e:
-        print(f"⚠️ IA indisponible ({e}) — accroche de secours.")
+        ia = get_ia_client()
+        return ia.generate(prompt, max_retries=2, temperature=0.7).strip()
+    except Exception as e:
+        logger.warning(f"⚠️  IA indisponible ({e}) — accroche de secours.")
 
     # --- Accroche de secours (100% locale, jamais en rade) ---
     accroches = []
