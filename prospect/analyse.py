@@ -1,27 +1,26 @@
 """
-Deep analyse des avis d'un commerce via IA (Google GenAI).
+Deep analyse des avis d'un commerce via IA (Gemini avec fallback Groq).
 Extrait : signal OR, douleurs, points forts, verdict, angle d'accroche.
 """
-import os
 import json
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
+from prospect.ia_client import get_ia_client
+from prospect.config import get_logger
 
-load_dotenv()
-
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODELE = "gemini-3.6-flash"
-
+logger = get_logger("analyse")
 
 # ============================================================
 # 🛡️ Détection des réponses génériques
 # ============================================================
 
 GENERIQUES_CONNUS = [
-    "merci", "thank", "nous vous remercions",
-    "au plaisir", "a bientot", "ravi",
-    "we appreciate", "thanks for",
+    "merci",
+    "thank",
+    "nous vous remercions",
+    "au plaisir",
+    "a bientot",
+    "ravi",
+    "we appreciate",
+    "thanks for",
 ]
 
 
@@ -80,12 +79,15 @@ def _contexte_avis(nom: str, avis: list) -> str:
 # ============================================================
 
 def analyser_avis(nom: str, avis: list) -> dict:
-    """Analyse les avis et retourne le dict de signaux via Google Gemini."""
+    """Analyse les avis et retourne le dict de signaux via IA (Gemini → Groq)."""
     if not avis:
-        return {"signal_or": "Aucun avis collecté.",
-                "douleurs": [], "points_forts": [],
-                "verdict": "Extrais d'abord les avis.",
-                "angle_accroche": ""}
+        return {
+            "signal_or": "Aucun avis collecté.",
+            "douleurs": [],
+            "points_forts": [],
+            "verdict": "Extrais d'abord les avis.",
+            "angle_accroche": "",
+        }
 
     contexte = _contexte_avis(nom, avis)
 
@@ -102,16 +104,13 @@ Analyse ces avis Google d'un commerce et reponds en JSON strict avec ces cles :
 """
 
     try:
-        resp = client.models.generate_content(
-            model=MODELE,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type='application/json',
-            )
-        )
-        return json.loads(resp.text)
+        ia = get_ia_client()
+        resp_text = ia.generate(prompt, json_mode=True, max_retries=3)
+        return json.loads(resp_text)
+    except json.JSONDecodeError:
+        logger.warning("⚠️  JSON parse error, fallback analyse")
     except Exception as e:
-        print(f"⚠️ Analyse IA echouee ({e}) — analyse degradee.")
+        logger.warning(f"⚠️  Analyse IA echouee ({e}) — analyse degradee.")
 
     # --- Fallback sans IA : analyse statistique pure ---
     notes = [a.get("note") for a in avis if a.get("note") is not None]
