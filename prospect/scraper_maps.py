@@ -1,11 +1,14 @@
 """
 Scraping Google Maps robuste avec retry, timeouts et error handling.
-v2 — Fixes : extract_reviews appelé, scroll auto sur le bon conteneur,
-coordonnées extraites AVANT l'onglet Avis.
+v3 — Fixes :
+  - Bouton "Plus" cliqué sur chaque avis -> verbatims COMPLETS (accroche v2)
+  - Regex note fiabilisee (ne matche plus "5 photos")
+  - Facebook/Instagram captures depuis la fiche Maps directement
+  - Texte de la reponse du gerant capture (reponse_gerant_texte)
+  - Coordonnees extraites AVANT l'onglet Avis (conservé de v2)
 """
 import re
 import time
-import logging
 from typing import Optional, Dict, List
 
 from prospect.config import (
@@ -20,7 +23,9 @@ logger = get_logger("scraper_maps")
 try:
     from playwright.sync_api import sync_playwright, Page
 except ImportError:
+    sync_playwright = None  # ✅ explicite : plus de "possibly unbound"
     logger.error("playwright non installé")
+
 
 
 # ============================================================
@@ -70,19 +75,64 @@ def get_attribute_safe(page: Page, selectors: List[str], attr: str, timeout: int
 
 
 # ============================================================
-# EXTRACTION DES AVIS
+# EXTRACTION DES AVIS — v3 avec "Plus" et verbatims complets
 # ============================================================
 
+def _parse_note_aria(alt: str) -> Optional[int]:
+    """
+    Parse l'aria-label d'une note Google de façon stricte.
+    Ex: "5 étoiles sur 5", "Rated 4.0 out of 5, 3 reviews".
+    Ne matche JAMAIS des contextes comme "5 photos".
+    """
+    if not alt:
+        return None
+    # Pattern prioritaire : "<n> étoile(s)" / "<n> star(s)" / "<n> out of 5" / "<n> sur 5"
+    m = re.search(
+        r"([0-5](?:[.,][05])?)\s*(?:étoile|star|out of|sur)",
+        alt, re.IGNORECASE
+    )
+    if m:
+        try:
+            val = float(m.group(1).replace(",", "."))
+            return int(val)  # arrondi 4.5 -> 4 pour la granularite classique Google
+        except ValueError:
+            pass
+    return None
+
+
+def _extraire_reponse_gerant(bloc) -> tuple:
+    """
+    Retourne (bool_reponse, texte_reponse).
+    Google affiche la reponse du gerant dans un bloc contenant
+    'Réponse du propriétaire' / 'Response from the owner'.
+    """
+    try:
+        blocs_rep = bloc.query_selector_all("div.CDe7pd, div[joraOf]")
+        for el in blocs_rep:
+            txt = (el.inner_text() or "").strip()
+            if txt:
+                # Retire le header type "Réponse du propriétaire" si present
+                lignes = txt.split("\n")
+                if len(lignes) > 1 and ("éponse" in lignes[0] or "esponse" in lignes[0]):
+                    return True, "\n".join(lignes[1:]).strip()
+                return True, txt
+    except Exception:
+        pass
+    return False, ""
+
+
 def extract_reviews(page: Page) -> List[Dict]:
-    """Extrait tous les avis visibles (blocs div.jftiEf + fallback)."""
+    """Extrait tous les avis visibles avec texte COMPLET (bouton 'Plus' cliqué)."""
     avis_liste = []
 
-    # Sélecteurs de blocs : classe actuelle + fallback historique
     blocs = page.query_selector_all("div.jftiEf")
     if not blocs:
         blocs = page.query_selector_all("div[data-review-id]")
 
     logger.info(f"📑 {len(blocs)} blocs d'avis détectés")
+
+    # ✅ FIX v3 #1 : déplier les avis tronqués AVANT l'extraction
+    _cliquer_tous_les_plus(page)
 
     for idx, bloc in enumerate(blocs):
         try:
@@ -93,31 +143,26 @@ def extract_reviews(page: Page) -> List[Dict]:
             else:
                 auteur = (bloc.inner_text() or "").strip().split("\n")[0]
 
-            # Note — regex fiabilisée (évite de matcher n'importe quel chiffre)
+            # Note — regex stricte via _parse_note_aria
             note = None
             img = bloc.query_selector("span[role='img']")
             if img:
-                alt = img.get_attribute("aria-label") or ""
-                m = re.search(r"(\d)\s*(?:étoile|star|sur|of)", alt)
-                if not m:
-                    m = re.search(r"(\d)(?=\s*(?:étoile|star))", alt)
-                if m:
-                    note = int(m.group(1))
+                note = _parse_note_aria(img.get_attribute("aria-label") or "")
 
-            # Texte
+            # Texte (déjà déplié grâce au clic sur "Plus")
             texte = ""
             el_txt = bloc.query_selector("span.wiI7pd, span.OCobZe")
             if el_txt:
                 texte = el_txt.inner_text().strip()
 
-            # Date
+            # Date relative ("il y a 2 mois", "3 septembre"...)
             date = ""
             el_date = bloc.query_selector("span.rsqaWe, span.dehysf")
             if el_date:
                 date = el_date.inner_text().strip()
 
-            # Réponse du gérant
-            reponse_gerant = bool(bloc.query_selector("div.CDe7pd"))
+            # ✅ FIX v3 #4 : réponse du gérant (bool + texte)
+            reponse_gerant, reponse_txt = _extraire_reponse_gerant(bloc)
 
             if auteur or texte:
                 avis_liste.append({
@@ -126,13 +171,37 @@ def extract_reviews(page: Page) -> List[Dict]:
                     "texte": texte,
                     "date": date,
                     "reponse_gerant": reponse_gerant,
+                    "reponse_gerant_texte": reponse_txt,
                 })
 
         except Exception as e:
             logger.debug(f"⚠️  Error parsing review {idx}: {e}")
             continue
 
+    logger.info(f"✅ {len(avis_liste)} avis extraits (verbatims complets)")
     return avis_liste
+
+
+def _cliquer_tous_les_plus(page: Page) -> None:
+    """
+    ✅ FIX v3 #1 : Google tronque les avis longs avec un bouton 'Plus'/'More'.
+    On clique tous ces boutons pour obtenir le texte complet du verbatim.
+    """
+    try:
+        boutons_plus = page.query_selector_all(
+            "button[aria-label*='Plus'], button[aria-label*='More'], "
+            "button.w8nwRe.kyuRq"
+        )
+        for btn in boutons_plus:
+            try:
+                btn.click()
+                page.wait_for_timeout(150)
+            except Exception:
+                continue
+        if boutons_plus:
+            logger.info(f"🔓 {len(boutons_plus)} avis dépliés (bouton 'Plus')")
+    except Exception as e:
+        logger.debug(f"Depliage avis: {e}")
 
 
 # ============================================================
@@ -173,12 +242,35 @@ def extract_address(page: Page) -> Optional[str]:
     return get_text_safe(page, MAPS_SELECTORS["address_element"])
 
 
+def extract_social_links(page: Page) -> Dict[str, Optional[str]]:
+    """
+    ✅ FIX v3 #3 : capture Facebook/Instagram directement depuis la fiche Maps
+    (les gérants les ajoutent souvent comme liens du profil).
+    """
+    liens: Dict[str, Optional[str]] = {"facebook": None, "instagram": None}
+
+    try:
+        ancres = page.query_selector_all("a[data-pid], a[href*='http']")
+        for a in ancres[:60]:
+            href = (a.get_attribute("href") or "").lower()
+            if href:
+                if not liens["facebook"] and ("facebook.com" in href or "fb.com" in href):
+                    liens["facebook"] = a.get_attribute("href")
+                elif not liens["instagram"] and "instagram.com" in href:
+                    liens["instagram"] = a.get_attribute("href")
+            if liens["facebook"] and liens["instagram"]:
+                break
+    except Exception as e:
+        logger.debug(f"Liaisons sociales Maps: {e}")
+    return liens
+
+
 # ============================================================
 # SCROLLING — détection automatique du vrai conteneur scrollable
 # ============================================================
 
 def scroll_reviews(page: Page, scroll_count: int = 8, delay_sec: float = 1.0) -> None:
-    """Trouve le div réellement scrollable (scrollHeight > clientHeight) et scrolle jusqu'à la fin."""
+    """Trouve le div réellement scrollable et scrolle jusqu'à la fin."""
     scrollable = None
     try:
         candidates = page.query_selector_all("div[role='main'] div")
@@ -208,7 +300,6 @@ def scroll_reviews(page: Page, scroll_count: int = 8, delay_sec: float = 1.0) ->
                     page.mouse.wheel(0, 4000)
                 page.wait_for_timeout(int(delay_sec * 1000))
 
-                # Stop si plus rien ne charge (fin des avis)
                 try:
                     h = scrollable.evaluate("el => el.scrollHeight") if scrollable else 0
                     if h == derniere_hauteur:
@@ -262,10 +353,14 @@ def scrape_google_maps(nom: str, adresse: str = "", headless: Optional[bool] = N
 
 
 def _scrape_once(requete: str, headless: bool) -> Dict:
+    if sync_playwright is None:
+        raise RuntimeError("Playwright non installé — lancez: pip install playwright && playwright install chromium")
+
     resultat = {
         "avis": [], "telephone": None, "website": None,
         "adresse": None, "email": None, "instagram": None, "facebook": None,
     }
+
 
     with sync_playwright() as pw:
         navigateur = pw.chromium.launch(headless=headless, args=PLAYWRIGHT_ARGS)
@@ -291,12 +386,17 @@ def _scrape_once(requete: str, headless: bool) -> Dict:
             click_safe(page, MAPS_SELECTORS["place_link"], timeout=3000)
             page.wait_for_timeout(2500)
 
-            # === COORDONNÉES D'ABORD (fiche ouverte, boutons visibles) ===
+            # === COORDONNÉES D'ABORD ===
             logger.info("📊 Extraction coordonnées...")
             resultat["telephone"] = extract_phone(page)
             resultat["website"] = extract_website(page)
             resultat["adresse"] = extract_address(page)
             logger.info(f"📞 tel={resultat['telephone']} | 🌍 site={resultat['website']}")
+
+            # ✅ FIX v3 #3 : réseaux sociaux depuis la fiche Maps (avant onglet avis)
+            logger.info("🔗 Liaisons sociales sur la fiche...")
+            sociaux = extract_social_links(page)
+            resultat.update(sociaux)
 
             # === REVIEWS TAB ===
             logger.info("📑 Onglet Avis...")
@@ -307,7 +407,7 @@ def _scrape_once(requete: str, headless: bool) -> Dict:
             logger.info("⏳ Scrolling avis...")
             scroll_reviews(page, scroll_count=8, delay_sec=1.0)
 
-            # === EXTRACTION AVIS ===
+            # === EXTRACTION AVIS (avec dépliage 'Plus') ===
             logger.info("📋 Extraction avis...")
             resultat["avis"] = extract_reviews(page)
 
@@ -317,12 +417,17 @@ def _scrape_once(requete: str, headless: bool) -> Dict:
         finally:
             navigateur.close()
 
-    # === Enrichissement web HORS du navigateur ===
-    if resultat.get("website"):
-        logger.info(f"🌐 Analyse du site web pour contacts : {resultat['website']}...")
+    # === Enrichissement web HORS du navigateur (email + réseaux complémentaires) ===
+    site_url = resultat.get("website")
+    if site_url:  # ✅ narrow : site_url est str ici, Pylance le sait
+        logger.info(f"🌐 Analyse du site web pour contacts : {site_url}...")
         try:
-            contacts = extraire_contacts_site(resultat["website"])
-            resultat.update(contacts)
+            contacts = extraire_contacts_site(site_url)
+
+            # ✅ Fusion non destructive : ne remplit que les champs vides
+            for k, v in contacts.items():
+                if v and not resultat.get(k):
+                    resultat[k] = v
             logger.info(
                 f"✅ Contacts web extraits : email={resultat.get('email')}, "
                 f"insta={bool(resultat.get('instagram'))}, fb={bool(resultat.get('facebook'))}"
