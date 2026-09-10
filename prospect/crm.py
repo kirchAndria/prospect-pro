@@ -128,14 +128,16 @@ def enregistrer_scan(niche: str, ville: str, nb_resultats: int):
     logger.info(f"📊 Scan enregistré: {niche} @ {ville} = {nb_resultats} résultats")
 
 
-def tous(statut: str | None = None, niche: str | None = None, ordre: str = "score") -> list:
+def tous(
+    statut: str | None = None,
+    niche: str | None = None,
+    ville: str | None = None,
+    temperature: str | None = None,
+    search: str | None = None,
+    ordre: str = "score"
+) -> list:
     """
-    Récupère tous les prospects, optionnellement filtrés par statut ou niche.
-    
-    Args:
-        statut: Filtrer par statut (nouveau, envoyé, etc.)
-        niche: Filtrer par niche
-        ordre: Champ de tri (score, date, temperature)
+    Récupère tous les prospects avec filtres flexibles et recherche plein texte.
     """
     with connect() as con:
         con.row_factory = sqlite3.Row
@@ -143,21 +145,36 @@ def tous(statut: str | None = None, niche: str | None = None, ordre: str = "scor
         query = "SELECT * FROM prospects WHERE 1=1"
         params = []
 
-        if statut:
+        if statut and statut != "tous":
             query += " AND statut=?"
             params.append(statut)
 
-        if niche:
+        if niche and niche != "toutes":
             query += " AND niche=?"
             params.append(niche)
+
+        if ville and ville != "toutes":
+            query += " AND ville=?"
+            params.append(ville)
+
+        if temperature and temperature != "toutes":
+            query += " AND temperature LIKE ?"
+            params.append(f"%{temperature}%")
+
+        if search and search.strip():
+            s = f"%{search.strip()}%"
+            query += " AND (nom LIKE ? OR adresse LIKE ? OR telephone LIKE ? OR email LIKE ? OR niche LIKE ? OR ville LIKE ?)"
+            params.extend([s, s, s, s, s, s])
 
         # Tri intelligent
         if ordre == "score":
             query += " ORDER BY score DESC"
         elif ordre == "date":
-            query += " ORDER BY created_at DESC"
+            query += " ORDER BY id DESC"
         elif ordre == "temperature":
-            query += " ORDER BY CASE temperature WHEN '🔥 CHAUD' THEN 0 WHEN '🌡️ TIÈDE' THEN 1 ELSE 2 END"
+            query += " ORDER BY CASE WHEN temperature LIKE '%CHAUD%' THEN 0 WHEN temperature LIKE '%TIÈDE%' THEN 1 ELSE 2 END, score DESC"
+        elif ordre == "nom":
+            query += " ORDER BY nom ASC"
         else:
             query += " ORDER BY score DESC"
 
@@ -196,12 +213,12 @@ def update_analyse(pid: int, analyse: dict):
 def update_field(pid: int, field: str, value):
     """
     Met à jour un champ de prospect DE MANIÈRE SÉCURISÉE.
-    
-    IMPORTANT: Utilise parameterized query pour éviter SQL injection.
     """
     allowed_fields = {
         "telephone", "email", "website", "instagram", "facebook",
-        "statut", "notes", "tags", "niche", "ville", "canal_envoi"
+        "statut", "notes", "tags", "niche", "ville", "canal_envoi",
+        "date_envoi", "date_reponse", "dernier_contact", "score",
+        "temperature", "raisons", "nom", "adresse", "note", "nb_avis"
     }
 
     if field not in allowed_fields:
@@ -211,6 +228,44 @@ def update_field(pid: int, field: str, value):
     with connect() as con:
         con.execute(f"UPDATE prospects SET {field}=? WHERE id=?",
                     (_clean(value), pid))
+
+
+def supprimer_prospect(pid: int):
+    """Supprime définitivement un prospect."""
+    with connect() as con:
+        con.execute("DELETE FROM prospects WHERE id=?", (pid,))
+    logger.info(f"🗑️ Prospect {pid} supprimé")
+
+
+def ajouter_manuel(fiche: dict) -> int:
+    """Ajoute manuellement un prospect et retourne son id."""
+    with connect() as con:
+        cur = con.cursor()
+        uid = fiche.get("id_place") or f"manuel_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        cur.execute("""
+            INSERT INTO prospects (
+                id_place, nom, adresse, niche, ville, note, nb_avis,
+                telephone, website, email, instagram, facebook, score, temperature, raisons, statut
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            uid,
+            _clean(fiche.get("nom", "Sans nom")),
+            _clean(fiche.get("adresse", "")),
+            _clean(fiche.get("niche", "")),
+            _clean(fiche.get("ville", "")),
+            float(fiche.get("note") or 0.0),
+            int(fiche.get("nb_avis") or 0),
+            _clean(fiche.get("telephone", "")),
+            _clean(fiche.get("website", "")),
+            _clean(fiche.get("email", "")),
+            _clean(fiche.get("instagram", "")),
+            _clean(fiche.get("facebook", "")),
+            int(fiche.get("score") or 0),
+            _clean(fiche.get("temperature", "❄️ FROID")),
+            _clean(fiche.get("raisons", "Ajout manuel")),
+            _clean(fiche.get("statut", "nouveau")),
+        ))
+        return cur.lastrowid
 
 
 def get_prospect(pid: int) -> dict | None:

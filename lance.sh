@@ -1,6 +1,6 @@
 #!/bin/bash
 # Lanceur de la Machine de Prospection
-cd /home/kirch/project/prospection-tool || exit 1
+cd "$(dirname "$0")" || exit 1
 
 echo "=========================================="
 echo "  MACHINE DE PROSPECTION"

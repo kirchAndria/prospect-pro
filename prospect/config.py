@@ -32,12 +32,9 @@ if not PLACES_API_KEY:
 if not GEMINI_API_KEY and not GROQ_API_KEY:
     logger.warning("⚠️  Ni GEMINI_API_KEY ni GROQ_API_KEY configurés")
 
-# ============================================================
-# AI MODELS
-# ============================================================
-
-GEMINI_MODEL = "gemini-2.0-flash"  # Modèle correct (v3.6 n'existe pas)
-GROQ_MODEL = "mixtral-8x7b-32768"  # Fallback performant
+GEMINI_MODEL = "gemini-3.6-flash"  # Modèle Gemini actif
+GROQ_MODEL = "openai/gpt-oss-120b"  # Fallback performant Groq
+GROQ_MODELS_FALLBACK = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 
 # ============================================================
 # PLAYWRIGHT CONFIG

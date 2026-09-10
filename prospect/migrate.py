@@ -11,7 +11,7 @@ COLONNES = {
 }
 
 def migrate():
-    with sqlite3.connect(crm.DB) as con:
+    with sqlite3.connect(crm.DB_PATH) as con:
         existantes = {r[1] for r in con.execute("PRAGMA table_info(prospects)")}
         for col, typ in COLONNES.items():
             if col not in existantes:
